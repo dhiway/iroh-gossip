@@ -1227,6 +1227,10 @@ pub(crate) mod tests {
                 delivered.push(timeout(Duration::from_secs(5), recv.try_next()).await??);
             }
 
+            let dials_before = (
+                ga.metrics().actor_tick_dialer_success.get(),
+                gb.metrics().actor_tick_dialer_success.get(),
+            );
             // Observe the remote NeighborDown before testing the surviving topic:
             // dropping handles alone does not acknowledge that Quit was processed.
             drop(owners.remove(0));
@@ -1237,12 +1241,22 @@ pub(crate) mod tests {
                 .broadcast(Bytes::from_static(b"still joined"))
                 .await?;
             let surviving = timeout(Duration::from_secs(5), owners[0].1.try_next()).await??;
-            Ok::<_, Box<dyn std::error::Error>>((delivered, left, surviving))
+            let dials_after = (
+                ga.metrics().actor_tick_dialer_success.get(),
+                gb.metrics().actor_tick_dialer_success.get(),
+            );
+            Ok::<_, Box<dyn std::error::Error>>((
+                delivered,
+                left,
+                surviving,
+                dials_before,
+                dials_after,
+            ))
         }
         .await;
         let stopped_a = ra.shutdown().await;
         let stopped_b = rb.shutdown().await;
-        let (delivered, left, surviving) = result?;
+        let (delivered, left, surviving, dials_before, dials_after) = result?;
         stopped_a?;
         stopped_b?;
         for (index, event) in delivered.into_iter().enumerate() {
@@ -1255,6 +1269,10 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(left, Some(Event::NeighborDown(a.id())));
+        assert_eq!(
+            dials_before, dials_after,
+            "leaving one topic must preserve the shared gossip connection"
+        );
         match surviving {
             Some(Event::Received(message)) => {
                 assert_eq!(message.content.as_ref(), b"still joined");
