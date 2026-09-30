@@ -435,12 +435,7 @@ impl Actor {
                     Some(Err(err)) => {
                         warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                         self.metrics.actor_tick_dialer_failure.inc();
-                        let peer_state = self.peers.get(&peer_id);
-                        let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
-                        if !is_active {
-                            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                                .await;
-                        }
+                        self.handle_dial_failed(peer_id).await;
                     }
                     None => {
                         warn!(peer = %peer_id.fmt_short(), "dial disconnected");
@@ -590,6 +585,21 @@ impl Actor {
         } else {
             debug!("peer already marked as disconnected");
         }
+    }
+
+    async fn handle_dial_failed(&mut self, peer_id: EndpointId) {
+        // An incoming connection may have succeeded while the outgoing dial failed.
+        // Preserve that active connection and its protocol membership.
+        if matches!(self.peers.get(&peer_id), Some(PeerState::Active { .. })) {
+            return;
+        }
+        // A failed initial dial may never have entered a protocol active view,
+        // so PeerDisconnected need not emit DisconnectPeer. Retire its queued
+        // messages before processing the event, allowing a later explicit join
+        // to initiate a new dial instead of appending to a stranded queue.
+        self.peers.remove(&peer_id);
+        self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+            .await;
     }
 
     async fn handle_rpc_msg(&mut self, msg: RpcMessage, now: Instant) {
@@ -1091,6 +1101,117 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::api::{ApiError, GossipReceiver, GossipSender};
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn explicit_join_recovers_after_initial_dial_failure() -> testresult::TestResult {
+        use crate::api::Event;
+
+        #[derive(Debug)]
+        struct ConnectivityProbe;
+        impl ProtocolHandler for ConnectivityProbe {
+            async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+                connection.closed().await;
+                Ok(())
+            }
+        }
+        const PROBE_ALPN: &[u8] = b"/gossip-test/connectivity";
+        let lookup = MemoryLookup::new();
+        let a = Endpoint::builder(presets::Minimal)
+            .address_lookup(lookup.clone())
+            .bind()
+            .await?;
+        let b = Endpoint::bind(presets::Minimal).await?;
+        let ga = Gossip::builder().spawn(a.clone());
+        let gb = Gossip::builder().spawn(b.clone());
+        let ra = Router::builder(a.clone())
+            .accept(GOSSIP_ALPN, ga.clone())
+            .spawn();
+        let rb = Router::builder(b.clone())
+            .accept(GOSSIP_ALPN, gb.clone())
+            .accept(PROBE_ALPN, ConnectivityProbe)
+            .spawn();
+        let topic = TopicId::from([38; 32]);
+        let _target_topic = gb.subscribe(topic, vec![]).await?;
+        let (send, mut recv) = ga.subscribe(topic, vec![b.id()]).await?.split();
+        timeout(Duration::from_secs(5), async {
+            while ga.metrics().actor_tick_dialer_failure.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        lookup.add_endpoint_info(b.addr());
+        // Prove the address works without introducing an incoming gossip connection.
+        let healthy = timeout(Duration::from_secs(5), a.connect(b.id(), PROBE_ALPN)).await??;
+        healthy.close(0u32.into(), b"probe complete");
+        send.join_peers(vec![b.id()]).await?;
+        let joined = timeout(Duration::from_secs(5), async {
+            while let Some(event) = recv.try_next().await? {
+                if event == Event::NeighborUp(b.id()) {
+                    return Ok::<_, ApiError>(true);
+                }
+            }
+            Ok(false)
+        })
+        .await;
+        ra.shutdown().await?;
+        rb.shutdown().await?;
+        assert!(
+            joined??,
+            "explicit join must redial after the address becomes available"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_dial_retires_pending_queue_but_preserves_active_connection() -> Result<()> {
+        let endpoint = Endpoint::bind(presets::Minimal).await?;
+        let (mut actor, _rpc_tx, _local_tx) = Actor::new(
+            endpoint.clone(),
+            proto::Config::default(),
+            Arc::new(Metrics::default()),
+            None,
+            GossipAddressLookup::default(),
+        );
+        let peer = SecretKey::generate().public();
+        let topic = TopicId::from([37; 32]);
+        actor
+            .handle_in_event(
+                InEvent::Command(topic, ProtoCommand::Join(vec![peer])),
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            matches!(actor.peers.get(&peer), Some(PeerState::Pending { queue }) if !queue.is_empty())
+        );
+        actor.handle_dial_failed(peer).await;
+        assert!(
+            !actor.peers.contains_key(&peer),
+            "failed pending dial must release its queue"
+        );
+
+        // Simulate an incoming connection accepted before the outgoing error.
+        let (send_tx, mut send_rx) = mpsc::channel(4);
+        actor.peers.insert(
+            peer,
+            PeerState::Active {
+                active_send_tx: send_tx,
+                active_conn_id: 17,
+                other_conns: vec![18],
+            },
+        );
+        actor.handle_dial_failed(peer).await;
+        assert!(
+            matches!(actor.peers.get(&peer), Some(PeerState::Active { active_conn_id: 17, other_conns, .. }) if other_conns == &[18])
+        );
+        assert!(
+            matches!(send_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "active send channel must remain open"
+        );
+        drop(actor);
+        endpoint.close().await;
+        Ok(())
+    }
 
     struct ManualActorLoop {
         actor: Actor,
