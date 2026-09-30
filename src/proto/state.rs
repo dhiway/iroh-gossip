@@ -317,13 +317,13 @@ fn handle_out_event<PI: PeerIdentity>(
             outbox.push(OutEvent::ScheduleTimer(delay, Timer { topic, timer }))
         }
         topic::OutEvent::DisconnectPeer(peer) => {
-            let empty = conns
-                .get_mut(&peer)
-                .map(|list| list.remove(&topic) || list.is_empty())
-                .unwrap_or(false);
-            if empty {
-                conns.remove(&peer);
-                outbox.push(OutEvent::DisconnectPeer(peer));
+            // The connection is shared by every topic that uses the peer.
+            if let Some(topics) = conns.get_mut(&peer) {
+                topics.remove(&topic);
+                if topics.is_empty() {
+                    conns.remove(&peer);
+                    outbox.push(OutEvent::DisconnectPeer(peer));
+                }
             }
         }
         topic::OutEvent::PeerData(peer, data) => outbox.push(OutEvent::PeerData(peer, data)),
@@ -377,5 +377,57 @@ fn track_in_event<PI: Serialize>(event: &InEvent<PI>, metrics: &Metrics) {
                     .inc_by(message.size().unwrap_or(0) as u64);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Leaving one topic must not disconnect a peer another topic still uses.
+    #[test]
+    fn disconnect_peer_waits_for_the_last_topic() {
+        let topic_a: TopicId = [1u8; 32].into();
+        let topic_b: TopicId = [2u8; 32].into();
+        let peer = 1u32;
+        let mut conns = ConnsMap::from([(peer, HashSet::from([topic_a, topic_b]))]);
+        let mut outbox = Outbox::new();
+
+        handle_out_event(
+            topic_a,
+            topic::OutEvent::DisconnectPeer(peer),
+            &mut conns,
+            &mut outbox,
+        );
+        assert!(
+            outbox.is_empty(),
+            "disconnected while topic_b still uses the peer"
+        );
+        assert_eq!(conns.get(&peer), Some(&HashSet::from([topic_b])));
+
+        // A repeated departure and an unknown peer must not close shared connections.
+        handle_out_event(
+            topic_a,
+            topic::OutEvent::DisconnectPeer(peer),
+            &mut conns,
+            &mut outbox,
+        );
+        handle_out_event(
+            topic_a,
+            topic::OutEvent::DisconnectPeer(2),
+            &mut conns,
+            &mut outbox,
+        );
+        assert!(outbox.is_empty());
+        assert_eq!(conns.get(&peer), Some(&HashSet::from([topic_b])));
+
+        handle_out_event(
+            topic_b,
+            topic::OutEvent::DisconnectPeer(peer),
+            &mut conns,
+            &mut outbox,
+        );
+        assert!(matches!(outbox[..], [OutEvent::DisconnectPeer(p)] if p == peer));
+        assert!(!conns.contains_key(&peer));
     }
 }
