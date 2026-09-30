@@ -1191,6 +1191,12 @@ pub(crate) mod tests {
         );
 
         // Simulate an incoming connection accepted before the outgoing error.
+        let mut events = actor
+            .topics
+            .entry(topic)
+            .or_default()
+            .event_sender
+            .subscribe();
         let (send_tx, mut send_rx) = mpsc::channel(4);
         actor.peers.insert(
             peer,
@@ -1200,7 +1206,44 @@ pub(crate) mod tests {
                 other_conns: vec![18],
             },
         );
+        // Deliver the peer's native join message to establish protocol membership,
+        // rather than only seeding the actor's transport state.
+        let mut peer_state = proto::State::new(
+            peer,
+            PeerData::default(),
+            proto::Config::default(),
+            StdRng::seed_from_u64(37),
+        );
+        let join = peer_state
+            .handle(
+                InEvent::Command(topic, ProtoCommand::Join(vec![endpoint.id()])),
+                Instant::now(),
+                None,
+            )
+            .find_map(|event| match event {
+                OutEvent::SendMessage(to, message) if to == endpoint.id() => Some(message),
+                _ => None,
+            })
+            .expect("joining peer must send a native join message");
+        actor
+            .handle_in_event(InEvent::RecvMessage(peer, join), Instant::now())
+            .await;
+        assert_eq!(events.try_recv().unwrap(), ProtoEvent::NeighborUp(peer));
+        assert!(actor.state.state(&topic).unwrap().has_active_peers());
+        assert!(actor.topics[&topic].neighbors.contains(&peer));
+        // Drain the native neighbor reply before checking the sender after failure.
+        assert!(send_rx.try_recv().is_ok());
+
         actor.handle_dial_failed(peer).await;
+        assert!(actor.state.state(&topic).unwrap().has_active_peers());
+        assert!(actor.topics[&topic].neighbors.contains(&peer));
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "failed outgoing dial must not emit NeighborDown for the active peer"
+        );
         assert!(
             matches!(actor.peers.get(&peer), Some(PeerState::Active { active_conn_id: 17, other_conns, .. }) if other_conns == &[18])
         );
