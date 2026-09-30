@@ -1163,6 +1163,108 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn two_topics_recover_after_dial_failure_and_survive_one_topic_leave(
+    ) -> testresult::TestResult {
+        use crate::api::Event;
+
+        #[derive(Debug)]
+        struct ConnectivityProbe;
+        impl ProtocolHandler for ConnectivityProbe {
+            async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+                connection.closed().await;
+                Ok(())
+            }
+        }
+        const PROBE_ALPN: &[u8] = b"/gossip-test/two-topic-connectivity";
+        let lookup = MemoryLookup::new();
+        let a = Endpoint::builder(presets::Minimal)
+            .address_lookup(lookup.clone())
+            .bind()
+            .await?;
+        let b = Endpoint::bind(presets::Minimal).await?;
+        let ga = Gossip::builder().spawn(a.clone());
+        let gb = Gossip::builder().spawn(b.clone());
+        let ra = Router::builder(a.clone())
+            .accept(GOSSIP_ALPN, ga.clone())
+            .spawn();
+        let rb = Router::builder(b.clone())
+            .accept(GOSSIP_ALPN, gb.clone())
+            .accept(PROBE_ALPN, ConnectivityProbe)
+            .spawn();
+
+        // Keep all assertions outside this future so routers also shut down on
+        // unexpected events. Each topic first observes a real failed native dial.
+        let result = async {
+            let topics = [TopicId::from([39; 32]), TopicId::from([40; 32])];
+            let mut owners = Vec::new();
+            let mut targets = Vec::new();
+            for topic in topics {
+                targets.push(gb.subscribe(topic, vec![]).await?.split());
+                let failures = ga.metrics().actor_tick_dialer_failure.get();
+                owners.push(ga.subscribe(topic, vec![b.id()]).await?.split());
+                timeout(Duration::from_secs(5), async {
+                    while ga.metrics().actor_tick_dialer_failure.get() == failures {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+            }
+            lookup.add_endpoint_info(b.addr());
+            let healthy = timeout(Duration::from_secs(5), a.connect(b.id(), PROBE_ALPN)).await??;
+            healthy.close(0u32.into(), b"probe complete");
+            for (send, _) in &owners {
+                send.join_peers(vec![b.id()]).await?;
+            }
+            for (_, recv) in owners.iter_mut().chain(targets.iter_mut()) {
+                timeout(Duration::from_secs(5), recv.joined()).await??;
+            }
+            let mut delivered = Vec::new();
+            for (index, ((send, _), (_, recv))) in owners.iter().zip(targets.iter_mut()).enumerate()
+            {
+                send.broadcast(Bytes::from(vec![index as u8])).await?;
+                delivered.push(timeout(Duration::from_secs(5), recv.try_next()).await??);
+            }
+
+            // Observe the remote NeighborDown before testing the surviving topic:
+            // dropping handles alone does not acknowledge that Quit was processed.
+            drop(owners.remove(0));
+            let left = timeout(Duration::from_secs(5), targets[0].1.try_next()).await??;
+            drop(targets.remove(0));
+            targets[0]
+                .0
+                .broadcast(Bytes::from_static(b"still joined"))
+                .await?;
+            let surviving = timeout(Duration::from_secs(5), owners[0].1.try_next()).await??;
+            Ok::<_, Box<dyn std::error::Error>>((delivered, left, surviving))
+        }
+        .await;
+        let stopped_a = ra.shutdown().await;
+        let stopped_b = rb.shutdown().await;
+        let (delivered, left, surviving) = result?;
+        stopped_a?;
+        stopped_b?;
+        for (index, event) in delivered.into_iter().enumerate() {
+            match event {
+                Some(Event::Received(message)) => {
+                    assert_eq!(message.content.as_ref(), &[index as u8]);
+                    assert_eq!(message.delivered_from, a.id());
+                }
+                other => panic!("topic {index} did not deliver after recovery: {other:?}"),
+            }
+        }
+        assert_eq!(left, Some(Event::NeighborDown(a.id())));
+        match surviving {
+            Some(Event::Received(message)) => {
+                assert_eq!(message.content.as_ref(), b"still joined");
+                assert_eq!(message.delivered_from, b.id());
+            }
+            other => panic!("remaining topic lost its shared connection: {other:?}"),
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn failed_dial_retires_pending_queue_but_preserves_active_connection() -> Result<()> {
         let endpoint = Endpoint::bind(presets::Minimal).await?;
