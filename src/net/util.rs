@@ -537,10 +537,7 @@ mod shutdown_tests {
             let mut send = SendLoop::new(conn, rx, 4096);
             let ended = held_finish(&mut send).await;
             let mut running = Box::pin(send.run(Vec::new()));
-            assert!(matches!(
-                n0_future::future::poll_once(&mut running).await,
-                None
-            ));
+            assert!(n0_future::future::poll_once(&mut running).await.is_none());
             drop(running);
             assert!(!ended.load(Ordering::SeqCst));
             send.shutdown().await.unwrap();

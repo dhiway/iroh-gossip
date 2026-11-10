@@ -1018,6 +1018,8 @@ impl<T> From<mpsc::error::SendError<T>> for ConnectionLoopError {
     }
 }
 
+// Existing native loop inputs plus its owner stop token stay explicit.
+#[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     from: PublicKey,
     conn: Connection,
