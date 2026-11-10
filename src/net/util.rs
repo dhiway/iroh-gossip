@@ -32,6 +32,8 @@ use crate::proto::{util::TimerMap, TopicId};
 #[stack_error(derive, add_meta, from_sources)]
 #[non_exhaustive]
 pub(crate) enum WriteError {
+    /// An owned stream-finishing task failed.
+    ChildFailed {},
     /// Connection error
     #[error("Connection error")]
     Connection {
@@ -201,6 +203,7 @@ pub(crate) struct SendLoop {
     buffer: Vec<u8>,
     max_message_size: usize,
     finishing: JoinSet<()>,
+    child_failed: bool,
     send_rx: mpsc::Receiver<ProtoMessage>,
 }
 
@@ -216,28 +219,15 @@ impl SendLoop {
             buffer: Default::default(),
             streams: Default::default(),
             finishing: Default::default(),
+            child_failed: false,
             send_rx,
         }
     }
 
     pub(crate) async fn run(&mut self, queue: Vec<ProtoMessage>) -> Result<(), WriteError> {
-        for msg in queue {
-            self.write_message(&msg).await?;
-        }
-        let conn_clone = self.conn.clone();
-        let closed = conn_clone.closed();
-        tokio::pin!(closed);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut closed => break,
-                Some(msg) = self.send_rx.recv() => self.write_message(&msg).await?,
-                _ = self.finishing.join_next(), if !self.finishing.is_empty() => {}
-                else => break,
-            }
-        }
-
-        // Close remaining streams.
+        self.send(queue).await?;
+        // Normal half completion preserves reception on this connection, while
+        // settling the finish jobs belonging to the completed outgoing half.
         for (topic_id, mut stream) in self.streams.drain() {
             stream.finish().ok();
             self.finishing.spawn(
@@ -248,22 +238,65 @@ impl SendLoop {
                 .instrument(tracing::Span::current()),
             );
         }
-        if !self.finishing.is_empty() {
-            trace!(
-                "send loop closing, waiting for {} send streams to finish",
-                self.finishing.len()
-            );
-            // Wait for the remote to acknowledge all streams are finished.
-            if let Err(_elapsed) = n0_future::time::timeout(Duration::from_secs(5), async move {
-                while self.finishing.join_next().await.is_some() {}
-            })
+        let finished = n0_future::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = self.finishing.join_next().await {
+                self.child_failed |= result.is_err();
+            }
+        })
+        .await;
+        if finished.is_err() {
+            debug!("not all send streams finished within timeout, abort and join");
+        }
+        self.shutdown()
             .await
-            {
-                debug!("not all send streams finished within timeout, abort")
+            .map_err(|()| e!(WriteError::ChildFailed))
+    }
+
+    async fn send(&mut self, queue: Vec<ProtoMessage>) -> Result<(), WriteError> {
+        for msg in queue {
+            self.write_message(&msg).await?;
+        }
+        let conn_clone = self.conn.clone();
+        let closed = conn_clone.closed();
+        tokio::pin!(closed);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut closed => break,
+                message = self.send_rx.recv() => match message {
+                    Some(message) => self.write_message(&message).await?,
+                    None => break,
+                },
+                result = self.finishing.join_next(), if !self.finishing.is_empty() => {
+                    if result.is_some_and(|result| result.is_err()) {
+                        self.child_failed = true;
+                        return Err(e!(WriteError::ChildFailed));
+                    }
+                }
             }
         }
-        debug!("send loop closed");
         Ok(())
+    }
+
+    /// Mandatory completion after any error, cancellation or normal finish grace.
+    /// The connection parent calls this after dropping its borrowed run future.
+    pub(crate) async fn shutdown(&mut self) -> Result<(), ()> {
+        self.send_rx.close();
+        while self.send_rx.try_recv().is_ok() {}
+        for (_, mut stream) in self.streams.drain() {
+            let _ = stream.reset(0u32.into());
+        }
+        self.finishing.abort_all();
+        while let Some(result) = self.finishing.join_next().await {
+            if let Err(error) = result {
+                self.child_failed |= !error.is_cancelled();
+            }
+        }
+        if self.child_failed {
+            Err(())
+        } else {
+            Ok(())
+        }
     }
 
     /// Write a [`ProtoMessage`] as a length-prefixed, postcard-encoded message on its stream.

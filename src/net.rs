@@ -24,7 +24,7 @@ use n0_future::{
 };
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, error_span, trace, warn, Instrument};
 
@@ -96,7 +96,6 @@ impl std::ops::Deref for Gossip {
 #[derive(Debug)]
 enum LocalActorMessage {
     HandleConnection(Connection),
-    Shutdown { reply: oneshot::Sender<()> },
 }
 
 #[allow(missing_docs)]
@@ -104,6 +103,7 @@ enum LocalActorMessage {
 #[non_exhaustive]
 pub enum Error {
     ActorDropped {},
+    ShutdownFailed {},
 }
 
 impl<T> From<mpsc::error::SendError<T>> for Error {
@@ -121,9 +121,28 @@ impl From<oneshot::error::RecvError> for Error {
 pub(crate) struct Inner {
     api: GossipApi,
     local_tx: mpsc::Sender<LocalActorMessage>,
-    _actor_handle: AbortOnDropHandle<()>,
+    stop: CancellationToken,
+    completion: Mutex<ActorCompletion>,
     max_message_size: usize,
     metrics: Arc<Metrics>,
+}
+
+/// The handle never leaves shared custody while a shutdown waiter can be dropped.
+#[derive(Debug)]
+struct ActorCompletion {
+    handle: Option<AbortOnDropHandle<Result<(), ()>>>,
+    result: Option<Result<(), ()>>,
+}
+
+/// Dropping a pending caller-owned handoff closes its exact connection too.
+struct ConnectionCloseGuard(Option<Connection>);
+
+impl Drop for ConnectionCloseGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = &self.0 {
+            conn.close(0u32.into(), b"gossip connection retired");
+        }
+    }
 }
 
 impl ProtocolHandler for Gossip {
@@ -202,6 +221,7 @@ impl Builder {
         );
         let me = actor.endpoint.id().fmt_short();
         let max_message_size = actor.state.max_message_size();
+        let stop = actor.stop.clone();
 
         let actor_handle = task::spawn(actor.run().instrument(error_span!("gossip", %me)));
 
@@ -211,7 +231,11 @@ impl Builder {
             inner: Inner {
                 api,
                 local_tx,
-                _actor_handle: AbortOnDropHandle::new(actor_handle),
+                stop,
+                completion: Mutex::new(ActorCompletion {
+                    handle: Some(AbortOnDropHandle::new(actor_handle)),
+                    result: None,
+                }),
                 max_message_size,
                 metrics,
             }
@@ -243,26 +267,58 @@ impl Gossip {
     /// Handle an incoming [`Connection`].
     ///
     /// Make sure to check the ALPN protocol yourself before passing the connection.
+    /// Successful channel handoff transfers custody to the actor. The accept-loop
+    /// owner must settle pending handoffs before claiming complete host retirement.
+    /// Cancellation or dropping a polled pending handoff closes its connection.
     pub async fn handle_connection(&self, conn: Connection) -> Result<(), Error> {
-        self.inner
-            .local_tx
-            .send(LocalActorMessage::HandleConnection(conn))
-            .await?;
+        let mut guard = ConnectionCloseGuard(Some(conn.clone()));
+        tokio::select! {
+            biased;
+            _ = self.inner.stop.cancelled() => return Err(e!(Error::ActorDropped)),
+            result = self.inner.local_tx.send(LocalActorMessage::HandleConnection(conn)) => result?,
+        }
+        if self.inner.stop.is_cancelled() {
+            return Err(e!(Error::ActorDropped));
+        }
+        guard.0 = None;
         Ok(())
     }
 
     /// Shutdown the gossip instance.
     ///
-    /// This leaves all topics, sending `Disconnect` messages to peers, and then
-    /// stops the gossip actor loop and drops all state and connections.
+    /// Stops issuance, discards queued protocol work and closes actor-owned gossip
+    /// connections. On native targets success waits for owned dial, connection,
+    /// stream-finish, topic-forwarder and lookup tasks. It leaves the Endpoint open.
+    /// Disconnect-frame delivery is not guaranteed during terminal shutdown.
+    ///
+    /// Once polled, shutdown remains requested if this waiter is cancelled. Other
+    /// clones may await the same cached outcome. Pending caller-owned accept and
+    /// handoff futures must separately be settled by their owner.
+    ///
+    /// Browser task cancellation does not provide the native destruction/panic
+    /// guarantee. Dropping all handles without this call is best-effort abort only.
     pub async fn shutdown(&self) -> Result<(), Error> {
-        let (reply, reply_rx) = oneshot::channel();
-        self.inner
-            .local_tx
-            .send(LocalActorMessage::Shutdown { reply })
-            .await?;
-        reply_rx.await?;
-        Ok(())
+        self.inner.stop.cancel();
+        let mut completion = self.inner.completion.lock().await;
+        if completion.result.is_none() {
+            let result = match completion.handle.as_mut() {
+                Some(handle) => match handle.await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(?error, "gossip actor did not complete normally");
+                        Err(())
+                    }
+                },
+                // Only manually driven test actors have no task handle.
+                None => Err(()),
+            };
+            completion.result = Some(result);
+            completion.handle = None;
+        }
+        completion
+            .result
+            .expect("completion recorded without another suspension")
+            .map_err(|()| e!(Error::ShutdownFailed))
     }
 
     /// Returns the metrics tracked for this gossip instance.
@@ -273,6 +329,8 @@ impl Gossip {
 
 /// Actor that sends and handles messages between the connection and main state loops
 struct Actor {
+    stop: CancellationToken,
+    failed: bool,
     alpn: Bytes,
     /// Protocol state
     state: proto::State<PublicKey, StdRng>,
@@ -329,6 +387,8 @@ impl Actor {
         let (in_event_tx, in_event_rx) = mpsc::channel(IN_EVENT_CAP);
 
         let actor = Actor {
+            stop: CancellationToken::new(),
+            failed: false,
             alpn: alpn.unwrap_or_else(|| GOSSIP_ALPN.to_vec().into()),
             endpoint,
             state,
@@ -351,12 +411,72 @@ impl Actor {
         (actor, rpc_tx, local_tx)
     }
 
-    pub async fn run(mut self) {
-        let mut addr_update_stream = self.setup().await;
+    pub async fn run(mut self) -> Result<(), ()> {
+        let stop = self.stop.clone();
+        let updates = tokio::select! {
+            biased;
+            _ = stop.cancelled() => None,
+            stream = self.setup() => Some(stream),
+        };
+        if let Some(mut updates) = updates {
+            let mut i = 0;
+            loop {
+                // This covers awaited branch bodies, including a full sender queue.
+                // Interrupted work is terminal and will never be resumed.
+                let keep_running = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => false,
+                    result = self.event_loop(&mut updates, i) => result,
+                };
+                if !keep_running {
+                    break;
+                }
+                i += 1;
+            }
+        }
+        self.teardown().await
+    }
 
-        let mut i = 0;
-        while self.event_loop(&mut addr_update_stream, i).await {
-            i += 1;
+    async fn teardown(&mut self) -> Result<(), ()> {
+        self.stop.cancel();
+        self.rpc_rx.close();
+        while self.rpc_rx.try_recv().is_ok() {}
+        self.local_rx.close();
+        while let Ok(LocalActorMessage::HandleConnection(conn)) = self.local_rx.try_recv() {
+            conn.close(0u32.into(), b"gossip shutdown before dispatch");
+        }
+        self.in_event_rx.close();
+        while self.in_event_rx.try_recv().is_ok() {}
+        self.command_rx = StreamGroup::new().keyed();
+        self.quit_queue.clear();
+        self.topics.clear();
+        self.peers.clear();
+        self.timers = Timers::new();
+        self.failed |= self.dialer.shutdown().await.is_err();
+        // Parents cooperate so they can settle their nested tasks.
+        while let Some(result) = self.connection_tasks.join_next().await {
+            match result {
+                Ok((_, conn, outcome)) => {
+                    conn.close(0u32.into(), b"gossip shutdown");
+                    self.failed |= matches!(outcome, Err(ConnectionLoopError::ChildFailed { .. }));
+                }
+                Err(error) => {
+                    warn!(?error, "connection task failed during shutdown");
+                    self.failed = true;
+                }
+            }
+        }
+        self.topic_event_forwarders.abort_all();
+        while let Some(result) = self.topic_event_forwarders.join_next().await {
+            if let Err(error) = result {
+                self.failed |= !error.is_cancelled();
+            }
+        }
+        self.failed |= self.address_lookup.shutdown().await.is_err();
+        if self.failed {
+            Err(())
+        } else {
+            Ok(())
         }
     }
 
@@ -384,14 +504,6 @@ impl Actor {
             biased;
             conn = self.local_rx.recv() => {
                 match conn {
-                    Some(LocalActorMessage::Shutdown { reply }) => {
-                        debug!("received shutdown message, quit all topics");
-                        self.quit_queue.extend(self.topics.keys().copied());
-                        self.process_quit_queue().await;
-                        debug!("all topics quit, stop gossip actor");
-                        reply.send(()).ok();
-                        return false;
-                    },
                     Some(LocalActorMessage::HandleConnection(conn)) => {
                         self.handle_connection(conn.remote_id(), ConnOrigin::Accept, conn);
                     }
@@ -423,7 +535,11 @@ impl Actor {
                 self.metrics.actor_tick_endpoint.inc();
                 self.handle_addr_update(new_address).await;
             }
-            (peer_id, res) = self.dialer.next_conn() => {
+            result = self.dialer.next_conn() => {
+                let Ok((peer_id, res)) = result else {
+                    self.failed = true;
+                    return false;
+                };
                 trace!(?i, "tick: dialer");
                 self.metrics.actor_tick_dialer.inc();
                 match res {
@@ -459,11 +575,21 @@ impl Actor {
             }
             Some(res) = self.connection_tasks.join_next(), if !self.connection_tasks.is_empty() => {
                 trace!(?i, "tick: connection_tasks");
-                let (peer_id, conn, result) = res.expect("connection task panicked");
+                let Ok((peer_id, conn, result)) = res else {
+                    self.failed = true;
+                    return false;
+                };
+                if matches!(result, Err(ConnectionLoopError::ChildFailed { .. })) {
+                    self.failed = true;
+                    return false;
+                }
                 self.handle_connection_task_finished(peer_id, conn, result).await;
             }
             Some(res) = self.topic_event_forwarders.join_next(), if !self.topic_event_forwarders.is_empty() => {
-                let topic_id = res.expect("topic event forwarder panicked");
+                let Ok(topic_id) = res else {
+                    self.failed = true;
+                    return false;
+                };
                 if let Some(state) = self.topics.get_mut(&topic_id) {
                     if !state.still_needed() {
                         self.quit_queue.push_back(topic_id);
@@ -535,10 +661,13 @@ impl Actor {
 
         let max_message_size = self.state.max_message_size();
         let in_event_tx = self.in_event_tx.clone();
+        let stop = self.stop.clone();
+        let connection_guard = ConnectionCloseGuard(Some(conn.clone()));
 
         // Spawn a task for this connection
         self.connection_tasks.spawn(
             async move {
+                let _connection_guard = connection_guard;
                 let res = connection_loop(
                     peer_id,
                     conn.clone(),
@@ -547,6 +676,7 @@ impl Actor {
                     in_event_tx,
                     max_message_size,
                     queue,
+                    stop,
                 )
                 .await;
                 (peer_id, conn, res)
@@ -865,6 +995,7 @@ enum ConnOrigin {
 #[stack_error(derive, add_meta, from_sources, std_sources)]
 #[non_exhaustive]
 enum ConnectionLoopError {
+    ChildFailed {},
     #[error(transparent)]
     Write {
         source: self::util::WriteError,
@@ -895,19 +1026,35 @@ async fn connection_loop(
     in_event_tx: mpsc::Sender<InEvent>,
     max_message_size: usize,
     queue: Vec<ProtoMessage>,
+    stop: CancellationToken,
 ) -> Result<(), ConnectionLoopError> {
     debug!(?origin, "connection established");
 
     let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
-    let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size);
-
-    let send_fut = send_loop.run(queue).instrument(error_span!("send"));
-    let recv_fut = recv_loop.run().instrument(error_span!("recv"));
-
-    let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
-    send_res?;
-    recv_res?;
-    Ok(())
+    let mut recv_loop = RecvLoop::new(from, conn.clone(), in_event_tx, max_message_size);
+    let result = {
+        let send = async {
+            send_loop
+                .run(queue)
+                .await
+                .map_err(ConnectionLoopError::from)
+        }
+        .instrument(error_span!("send"));
+        let recv = async { recv_loop.run().await.map_err(ConnectionLoopError::from) }
+            .instrument(error_span!("recv"));
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => Ok(()),
+            result = async { tokio::try_join!(send, recv).map(|_| ()) } => result,
+        }
+    };
+    // A successful half alone does not close a connection: the peer may still
+    // send on it after our sender was replaced. Stop or either error reaches here.
+    conn.close(0u32.into(), b"gossip connection loop completed");
+    if send_loop.shutdown().await.is_err() {
+        return Err(e!(ConnectionLoopError::ChildFailed));
+    }
+    result
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -1050,31 +1197,51 @@ impl Dialer {
     /// `None` means disconnected
     async fn next_conn(
         &mut self,
-    ) -> (
-        EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
-    ) {
-        match self.pending_dials.is_empty() {
-            false => {
-                let (endpoint_id, res) = loop {
-                    match self.pending.join_next().await {
-                        Some(Ok((endpoint_id, res))) => {
-                            self.pending_dials.remove(&endpoint_id);
-                            break (endpoint_id, res);
-                        }
-                        Some(Err(e)) => {
-                            error!("next conn error: {:?}", e);
-                        }
-                        None => {
-                            error!("no more pending conns available");
-                            std::future::pending().await
-                        }
-                    }
-                };
-
-                (endpoint_id, res)
+    ) -> Result<
+        (
+            EndpointId,
+            Option<Result<Connection, iroh::endpoint::ConnectError>>,
+        ),
+        (),
+    > {
+        if self.pending_dials.is_empty() {
+            std::future::pending().await
+        } else {
+            match self.pending.join_next().await {
+                Some(Ok((endpoint_id, res))) => {
+                    self.pending_dials.remove(&endpoint_id);
+                    Ok((endpoint_id, res))
+                }
+                Some(Err(error)) => {
+                    error!(?error, "dial task failed");
+                    Err(())
+                }
+                None => {
+                    error!("pending dial records have no owned tasks");
+                    Err(())
+                }
             }
-            true => std::future::pending().await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<(), ()> {
+        for cancel in self.pending_dials.values() {
+            cancel.cancel();
+        }
+        self.pending.abort_all();
+        let mut failed = false;
+        while let Some(result) = self.pending.join_next().await {
+            match result {
+                Ok((_, Some(Ok(conn)))) => conn.close(0u32.into(), b"gossip dial retired"),
+                Ok(_) => {}
+                Err(error) => failed |= !error.is_cancelled(),
+            }
+        }
+        self.pending_dials.clear();
+        if failed {
+            Err(())
+        } else {
+            Ok(())
         }
     }
 }
@@ -1430,8 +1597,9 @@ pub(crate) mod tests {
         ///
         /// This creates the endpoint and spawns the endpoint loop as well. The handle for the
         /// endpoing task is returned along the gossip instance and actor. Since the actor is not
-        /// actually spawned as [`Builder::spawn`] would, the gossip instance will have a
-        /// handle to a dummy task instead.
+        /// actually spawned as [`Builder::spawn`] would, the completion slot is empty.
+        /// This manual helper cannot claim successful public shutdown. `t_new` installs
+        /// the real actor handle before returning its normal-loop instance.
         async fn t_new_with_actor(
             rng: &mut rand::rngs::ChaCha12Rng,
             config: proto::Config,
@@ -1450,12 +1618,16 @@ pub(crate) mod tests {
                 Actor::new(endpoint, config, metrics.clone(), None, address_lookup);
             let max_message_size = actor.state.max_message_size();
 
-            let _actor_handle = AbortOnDropHandle::new(task::spawn(n0_future::future::pending()));
+            let stop = actor.stop.clone();
             let gossip = Self {
                 inner: Inner {
                     api: GossipApi::local(to_actor_tx),
                     local_tx: conn_tx,
-                    _actor_handle,
+                    stop,
+                    completion: Mutex::new(ActorCompletion {
+                        handle: None,
+                        result: None,
+                    }),
                     max_message_size,
                     metrics,
                 }
@@ -1482,9 +1654,11 @@ pub(crate) mod tests {
                 Gossip::t_new_with_actor(rng, config, relay_map, cancel).await?;
             let ep = actor.endpoint.clone();
             let me = ep.id().fmt_short();
+            let stop_guard = actor.stop.clone().drop_guard();
             let actor_handle =
                 task::spawn(actor.run().instrument(tracing::error_span!("gossip", %me)));
-            Ok((g, ep, ep_handle, AbortOnDropHandle::new(actor_handle)))
+            g.inner.completion.lock().await.handle = Some(AbortOnDropHandle::new(actor_handle));
+            Ok((g, ep, ep_handle, stop_guard))
         }
     }
 
