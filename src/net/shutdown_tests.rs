@@ -123,7 +123,7 @@ fn join_message(from: EndpointId, to: EndpointId, topic: TopicId) -> ProtoMessag
 
 async fn received(receiver: &mut GossipReceiver, expected: &[u8]) {
     loop {
-        match receiver.try_next().await.unwrap() {
+        match TryStreamExt::try_next(receiver).await.unwrap() {
             Some(Event::Received(message)) => {
                 assert_eq!(message.content.as_ref(), expected);
                 return;
