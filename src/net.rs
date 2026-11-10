@@ -39,6 +39,8 @@ use crate::{
 };
 
 mod address_lookup;
+#[cfg(test)]
+mod shutdown_tests;
 mod util;
 
 /// ALPN protocol name
