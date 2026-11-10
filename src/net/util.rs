@@ -466,3 +466,169 @@ impl<T> Timers<T> {
         self.map.pop_before(now)
     }
 }
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use iroh::{endpoint::presets, Endpoint};
+    use rand::{rngs::StdRng, SeedableRng};
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::proto::{self, PeerData};
+
+    const ALPN: &[u8] = b"/gossip-finish-shutdown-test";
+
+    struct Ended(Arc<AtomicBool>);
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        async fn endpoint() -> Endpoint {
+            Endpoint::builder(presets::Minimal)
+                .alpns(vec![ALPN.to_vec()])
+                .clear_address_lookup()
+                .clear_ip_transports()
+                .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+                .unwrap()
+                .bind()
+                .await
+                .unwrap()
+        }
+        let a = endpoint().await;
+        let b = endpoint().await;
+        let (outgoing, incoming) = tokio::join!(a.connect(b.addr(), ALPN), async {
+            b.accept().await.unwrap().await.unwrap()
+        });
+        (a, b, outgoing.unwrap(), incoming)
+    }
+
+    // The gate holds an actual owned stream-finishing job after native finish.
+    // Its Drop guard witnesses destruction, rather than an abort request.
+    async fn held_finish(send: &mut SendLoop) -> Arc<AtomicBool> {
+        let mut stream = send.conn.open_uni().await.unwrap();
+        stream.write_all(b"native finishing fixture").await.unwrap();
+        stream.finish().unwrap();
+        let ended = Arc::new(AtomicBool::new(false));
+        let guard = Ended(ended.clone());
+        let (entered, wait) = oneshot::channel();
+        send.finishing.spawn(async move {
+            let _guard = guard;
+            entered.send(()).unwrap();
+            let _ = stream.stopped().await;
+            std::future::pending::<()>().await;
+        });
+        wait.await.unwrap();
+        ended
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_joins_finishing_jobs_before_returning() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (a, b, conn, peer) = pair().await;
+            let (_tx, rx) = mpsc::channel(1);
+            let mut send = SendLoop::new(conn, rx, 4096);
+            let ended = held_finish(&mut send).await;
+            let mut running = Box::pin(send.run(Vec::new()));
+            assert!(matches!(
+                n0_future::future::poll_once(&mut running).await,
+                None
+            ));
+            drop(running);
+            assert!(!ended.load(Ordering::SeqCst));
+            send.shutdown().await.unwrap();
+            assert!(ended.load(Ordering::SeqCst));
+            assert!(send.finishing.is_empty());
+            drop(peer);
+            a.close().await;
+            b.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_finish_grace_expiry_joins_before_success() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (a, b, conn, peer) = pair().await;
+            let (tx, rx) = mpsc::channel(1);
+            let mut send = SendLoop::new(conn, rx, 4096);
+            let ended = held_finish(&mut send).await;
+            drop(tx);
+            send.run(Vec::new()).await.unwrap();
+            assert!(ended.load(Ordering::SeqCst));
+            assert!(send.finishing.is_empty());
+            assert!(
+                peer.close_reason().is_none(),
+                "normal send half does not close receive connection"
+            );
+            a.close().await;
+            b.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_write_error_and_child_panic_retain_cleanup_failure() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (a, b, conn, peer) = pair().await;
+            let (_tx, rx) = mpsc::channel(1);
+            let mut send = SendLoop::new(conn, rx, 1);
+            let ended = held_finish(&mut send).await;
+            let mut state = proto::State::new(
+                a.id(),
+                PeerData::default(),
+                proto::Config::default(),
+                StdRng::seed_from_u64(41),
+            );
+            let message = state
+                .handle(
+                    InEvent::Command(TopicId::from([41; 32]), proto::Command::Join(vec![b.id()])),
+                    Instant::now(),
+                    None,
+                )
+                .find_map(|event| match event {
+                    proto::OutEvent::SendMessage(_, msg) => Some(msg),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(matches!(
+                send.run(vec![message]).await,
+                Err(WriteError::TooLarge { .. })
+            ));
+            assert!(!ended.load(Ordering::SeqCst));
+            send.shutdown().await.unwrap();
+            assert!(ended.load(Ordering::SeqCst));
+
+            let (_tx, rx) = mpsc::channel(1);
+            let mut send = SendLoop::new(peer, rx, 4096);
+            let (started, seen) = oneshot::channel();
+            let join = send.finishing.spawn(async move {
+                started.send(()).unwrap();
+                panic!("owned finishing child fixture");
+            });
+            seen.await.unwrap();
+            // A second native task observes that the first completed before shutdown.
+            while !join.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            assert!(send.shutdown().await.is_err());
+            assert!(
+                send.shutdown().await.is_err(),
+                "failure must remain sticky after JoinSet drains"
+            );
+            a.close().await;
+            b.close().await;
+        })
+        .await
+        .unwrap();
+    }
+}
