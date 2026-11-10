@@ -1034,8 +1034,18 @@ async fn connection_loop(
 ) -> Result<(), ConnectionLoopError> {
     debug!(?origin, "connection established");
 
-    let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
-    let mut recv_loop = RecvLoop::new(from, conn.clone(), in_event_tx, max_message_size);
+    let send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
+    let recv_loop = RecvLoop::new(from, conn.clone(), in_event_tx, max_message_size);
+    run_connection_loop(conn, send_loop, recv_loop, queue, stop).await
+}
+
+async fn run_connection_loop(
+    conn: Connection,
+    mut send_loop: SendLoop,
+    mut recv_loop: RecvLoop,
+    queue: Vec<ProtoMessage>,
+    stop: CancellationToken,
+) -> Result<(), ConnectionLoopError> {
     let result = {
         let send = async {
             send_loop
@@ -1159,6 +1169,8 @@ struct Dialer {
         Option<Result<Connection, iroh::endpoint::ConnectError>>,
     )>,
     pending_dials: HashMap<EndpointId, CancellationToken>,
+    #[cfg(test)]
+    issued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Dialer {
@@ -1168,6 +1180,8 @@ impl Dialer {
             endpoint,
             pending: Default::default(),
             pending_dials: Default::default(),
+            #[cfg(test)]
+            issued: Default::default(),
         }
     }
 
@@ -1176,6 +1190,9 @@ impl Dialer {
         if self.is_pending(endpoint_id) {
             return;
         }
+        #[cfg(test)]
+        self.issued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let cancel = CancellationToken::new();
         self.pending_dials.insert(endpoint_id, cancel.clone());
         let endpoint = self.endpoint.clone();

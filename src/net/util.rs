@@ -468,20 +468,15 @@ impl<T> Timers<T> {
 }
 
 #[cfg(test)]
-mod shutdown_tests {
+pub(super) mod shutdown_test_support {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
 
-    use iroh::{endpoint::presets, Endpoint};
-    use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::proto::{self, PeerData};
-
-    const ALPN: &[u8] = b"/gossip-finish-shutdown-test";
 
     struct Ended(Arc<AtomicBool>);
     impl Drop for Ended {
@@ -489,6 +484,47 @@ mod shutdown_tests {
             self.0.store(true, Ordering::SeqCst);
         }
     }
+
+    // A test gate retains an actual native finishing stream in the owning set.
+    pub(in crate::net) async fn held_finish(send: &mut SendLoop) -> Arc<AtomicBool> {
+        let mut stream = send.conn.open_uni().await.unwrap();
+        stream.write_all(b"native finishing fixture").await.unwrap();
+        stream.finish().unwrap();
+        let ended = Arc::new(AtomicBool::new(false));
+        let guard = Ended(ended.clone());
+        let (entered, wait) = oneshot::channel();
+        send.finishing.spawn(async move {
+            let _guard = guard;
+            entered.send(()).unwrap();
+            let _ = stream.stopped().await;
+            std::future::pending::<()>().await;
+        });
+        wait.await.unwrap();
+        ended
+    }
+
+    pub(in crate::net) fn failing_finish(send: &mut SendLoop) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        send.finishing.spawn(async move {
+            wait.await.unwrap();
+            panic!("owned finishing child fixture");
+        });
+        release
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::sync::atomic::Ordering;
+
+    use iroh::{endpoint::presets, Endpoint};
+    use rand::{rngs::StdRng, SeedableRng};
+    use tokio::sync::oneshot;
+
+    use super::{shutdown_test_support::held_finish, *};
+    use crate::proto::{self, PeerData};
+
+    const ALPN: &[u8] = b"/gossip-finish-shutdown-test";
 
     async fn pair() -> (Endpoint, Endpoint, Connection, Connection) {
         async fn endpoint() -> Endpoint {
@@ -508,25 +544,6 @@ mod shutdown_tests {
             b.accept().await.unwrap().await.unwrap()
         });
         (a, b, outgoing.unwrap(), incoming)
-    }
-
-    // The gate holds an actual owned stream-finishing job after native finish.
-    // Its Drop guard witnesses destruction, rather than an abort request.
-    async fn held_finish(send: &mut SendLoop) -> Arc<AtomicBool> {
-        let mut stream = send.conn.open_uni().await.unwrap();
-        stream.write_all(b"native finishing fixture").await.unwrap();
-        stream.finish().unwrap();
-        let ended = Arc::new(AtomicBool::new(false));
-        let guard = Ended(ended.clone());
-        let (entered, wait) = oneshot::channel();
-        send.finishing.spawn(async move {
-            let _guard = guard;
-            entered.send(()).unwrap();
-            let _ = stream.stopped().await;
-            std::future::pending::<()>().await;
-        });
-        wait.await.unwrap();
-        ended
     }
 
     #[tokio::test]

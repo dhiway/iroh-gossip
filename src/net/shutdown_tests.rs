@@ -170,13 +170,194 @@ async fn public_shutdown_retains_actual_actor_join_across_dropped_and_concurrent
     .expect("actor join custody timed out");
 }
 
+#[derive(Clone, Copy)]
+enum ConnectionEnd {
+    Stop,
+    WriteError,
+    ChildPanic,
+}
+
+async fn public_nested_completion(end: ConnectionEnd) {
+    tokio::time::timeout(LIMIT, async {
+        let a = endpoint().await;
+        let b = endpoint().await;
+        let (conn, _peer) = pair(&a, &b, GOSSIP_ALPN).await;
+        let (mut actor, rpc, local) = actor(&a);
+        let (send_tx, send_rx) = mpsc::channel(1);
+        let limit = if matches!(end, ConnectionEnd::WriteError) {
+            1
+        } else {
+            4096
+        };
+        let mut send = SendLoop::new(conn.clone(), send_rx, limit);
+        let child_ended = util::shutdown_test_support::held_finish(&mut send).await;
+        let panic_child = matches!(end, ConnectionEnd::ChildPanic)
+            .then(|| util::shutdown_test_support::failing_finish(&mut send));
+        let recv = RecvLoop::new(b.id(), conn.clone(), actor.in_event_tx.clone(), 4096);
+        let mut running = Box::pin(run_connection_loop(
+            conn.clone(),
+            send,
+            recv,
+            vec![],
+            actor.stop.clone(),
+        ));
+        // Both native halves have been polled and are held. The peer sends no
+        // stream, while the sender has no message. Only the selected trigger
+        // below may release this connection parent.
+        assert_pending(running.as_mut()).await;
+        assert!(!child_ended.load(Ordering::SeqCst));
+        let parent_ended = Arc::new(AtomicBool::new(false));
+        let parent_guard = DropWitness(parent_ended.clone());
+        let child_at_parent = child_ended.clone();
+        let (parent_result, parent_wait) = oneshot::channel();
+        let peer_id = b.id();
+        actor.connection_tasks.spawn(async move {
+            let _guard = parent_guard;
+            let result = running.await;
+            // This immediate assertion is before another task can process a
+            // merely requested abort on the current-thread test runtime.
+            assert!(
+                child_at_parent.load(Ordering::SeqCst),
+                "parent returned before nested destruction"
+            );
+            parent_result
+                .send(matches!(
+                    result,
+                    Err(ConnectionLoopError::ChildFailed { .. })
+                ))
+                .unwrap();
+            (peer_id, conn, result)
+        });
+        let (ended_tx, ended_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let failed = matches!(end, ConnectionEnd::ChildPanic);
+        let gossip = gossip_with_task(
+            (actor, rpc, local),
+            None,
+            failed.then_some((ended_tx, release_rx)),
+        );
+        match end {
+            ConnectionEnd::Stop => {
+                gossip.shutdown().await.unwrap();
+                assert!(!parent_wait.await.unwrap());
+            }
+            ConnectionEnd::WriteError => {
+                send_tx
+                    .send(join_message(a.id(), b.id(), TopicId::from([57; 32])))
+                    .await
+                    .unwrap();
+                assert!(
+                    !parent_wait.await.unwrap(),
+                    "ordinary write failure became lifecycle failure"
+                );
+                gossip.shutdown().await.unwrap();
+            }
+            ConnectionEnd::ChildPanic => {
+                panic_child.unwrap().send(()).unwrap();
+                assert!(
+                    parent_wait.await.unwrap(),
+                    "nested panic was lost at the parent"
+                );
+                // No public stop was requested: the native connection result
+                // must have stopped the normal actor loop and completed teardown.
+                ended_rx.await.unwrap();
+                assert!(parent_ended.load(Ordering::SeqCst));
+                let retained = gossip.clone();
+                let mut first = Box::pin(gossip.shutdown());
+                assert_pending(first.as_mut()).await;
+                drop(first);
+                let mut second = Box::pin(gossip.shutdown());
+                let mut third = Box::pin(retained.shutdown());
+                assert_pending(second.as_mut()).await;
+                assert_pending(third.as_mut()).await;
+                release_tx.send(()).unwrap();
+                let (second, third) = tokio::join!(second, third);
+                assert!(matches!(second, Err(Error::ShutdownFailed { .. })));
+                assert!(matches!(third, Err(Error::ShutdownFailed { .. })));
+                assert!(matches!(
+                    gossip.shutdown().await,
+                    Err(Error::ShutdownFailed { .. })
+                ));
+                assert_eq!(gossip.inner.completion.lock().await.result, Some(Err(())));
+            }
+        }
+        assert!(child_ended.load(Ordering::SeqCst));
+        assert!(parent_ended.load(Ordering::SeqCst));
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .expect("public nested completion timed out");
+}
+
+#[tokio::test]
+async fn public_shutdown_joins_connection_parent_and_held_native_finish() {
+    public_nested_completion(ConnectionEnd::Stop).await;
+}
+
+#[tokio::test]
+async fn early_native_write_error_joins_nested_finish_with_receive_held() {
+    public_nested_completion(ConnectionEnd::WriteError).await;
+}
+
+#[tokio::test]
+async fn normally_consumed_finishing_panic_stays_failed_across_public_waiters() {
+    public_nested_completion(ConnectionEnd::ChildPanic).await;
+}
+
+#[tokio::test]
+async fn actual_actor_panic_is_a_sticky_public_shutdown_failure() {
+    tokio::time::timeout(LIMIT, async {
+        let endpoint = endpoint().await;
+        let (mut actor, rpc, local) = actor(&endpoint);
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_tx);
+        // Violate the real actor's private invariant deliberately. Its event
+        // loop panics on an absent internal event, not in a substituted task.
+        actor.in_event_rx = closed_rx;
+        let gossip = gossip_with_task((actor, rpc, local), None, None);
+        while !gossip
+            .inner
+            .completion
+            .lock()
+            .await
+            .handle
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        let retained = gossip.clone();
+        let (one, two) = tokio::join!(gossip.shutdown(), retained.shutdown());
+        assert!(matches!(one, Err(Error::ShutdownFailed { .. })));
+        assert!(matches!(two, Err(Error::ShutdownFailed { .. })));
+        assert!(matches!(
+            gossip.shutdown().await,
+            Err(Error::ShutdownFailed { .. })
+        ));
+        assert_eq!(gossip.inner.completion.lock().await.result, Some(Err(())));
+        endpoint.close().await;
+    })
+    .await
+    .expect("actor panic outcome timed out");
+}
+
 #[tokio::test]
 async fn shutdown_interrupts_full_active_sender_and_discards_queued_old_commands() {
     tokio::time::timeout(LIMIT, async {
         let endpoint = endpoint().await;
         let (mut actor, rpc, local) = actor(&endpoint);
         let peer = SecretKey::from_bytes(&[47; 32]).public();
+        let fresh_peer = SecretKey::from_bytes(&[48; 32]).public();
         let topic = TopicId::from([46; 32]);
+        let old_api = GossipApi::local(rpc.clone());
+        let (old_sender, _old_receiver) = old_api.subscribe(topic, vec![]).await.unwrap().split();
+        let request = actor.rpc_rx.recv().await.unwrap();
+        actor.handle_rpc_msg(request, Instant::now()).await;
+        assert!(actor.topics.contains_key(&topic));
+        let issued = actor.dialer.issued.clone();
+        assert_eq!(issued.load(Ordering::SeqCst), 0);
         let (send, mut held_receiver) = mpsc::channel(1);
         send.send(join_message(endpoint.id(), peer, topic))
             .await
@@ -200,15 +381,17 @@ async fn shutdown_interrupts_full_active_sender_and_discards_queued_old_commands
         // Capacity is returned only after the real actor consumes this command.
         // Its first native output then blocks on the full active sender above.
         drop(input.reserve().await.unwrap());
-        let old_api = gossip.inner.api.clone();
-        let (old_sender, _old_receiver) =
-            gossip.subscribe(topic, vec![peer]).await.unwrap().split();
-        old_sender.join_peers(vec![peer]).await.unwrap();
+        old_sender.join_peers(vec![fresh_peer]).await.unwrap();
         old_sender
             .broadcast(Bytes::from_static(b"must not run"))
             .await
             .unwrap();
         gossip.shutdown().await.unwrap();
+        assert_eq!(
+            issued.load(Ordering::SeqCst),
+            0,
+            "queued join issued a new dial"
+        );
         assert!(
             held_receiver.recv().await.is_some(),
             "held queue was never drained by a connection"
