@@ -16,6 +16,9 @@ pub enum Error {
     /// [`Gossip::shutdown`]: crate::Gossip::shutdown
     #[error("the gossip actor stopped")]
     Closed,
+    /// The gossip actor or one of its owned tasks failed.
+    #[error("gossip shutdown did not complete normally")]
+    ShutdownFailed,
     /// The message content is over the limit, see [`GossipSender::max_content_size`].
     ///
     /// [`GossipSender::max_content_size`]: crate::GossipSender::max_content_size

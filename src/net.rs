@@ -9,7 +9,8 @@ use iroh::{
 };
 use n0_error::e;
 use n0_future::task::{self, AbortOnDropHandle};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{error_span, warn, Instrument};
 
 use self::{
@@ -77,8 +78,7 @@ pub struct Gossip {
 #[derive(Debug)]
 enum ToActor {
     Join(Join),
-    Connection(Connection),
-    Shutdown { reply: oneshot::Sender<()> },
+    Connection(OwnedConnection),
 }
 
 /// A request from [`Gossip::subscribe_with_opts`] to the actor to join a topic.
@@ -95,11 +95,54 @@ struct Join {
 #[derive(Debug)]
 struct Inner {
     to_actor: mpsc::Sender<ToActor>,
-    _actor_handle: AbortOnDropHandle<()>,
+    stop: CancellationToken,
+    completion: Mutex<TaskCompletion>,
+    address_lookup: GossipAddressLookup,
     max_message_size: usize,
     /// The largest content that a broadcast takes.
     max_content: usize,
     metrics: Arc<Metrics>,
+}
+
+/// Keep the join handle in shared custody even when the waiter is cancelled.
+#[derive(Debug)]
+enum TaskCompletion {
+    Running(AbortOnDropHandle<Result<(), ()>>),
+    Complete(Result<(), ()>),
+}
+
+impl TaskCompletion {
+    async fn wait(&mut self) -> Result<(), ()> {
+        match self {
+            Self::Complete(result) => *result,
+            Self::Running(task) => {
+                let result = task.await.unwrap_or_else(|err| {
+                    warn!(?err, "gossip task did not finish normally");
+                    Err(())
+                });
+                *self = Self::Complete(result);
+                result
+            }
+        }
+    }
+}
+
+/// Closes an accepted connection if its handoff or task is dropped.
+#[derive(Debug)]
+struct OwnedConnection(Option<Connection>);
+
+impl OwnedConnection {
+    fn into_inner(mut self) -> Connection {
+        self.0.take().expect("owned connection")
+    }
+}
+
+impl Drop for OwnedConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.as_ref().filter(|conn| conn.close_reason().is_none()) {
+            conn.close(0u32.into(), b"gossip shutdown");
+        }
+    }
 }
 
 impl ProtocolHandler for Gossip {
@@ -216,13 +259,21 @@ impl Builder {
         }
         let me = endpoint.id().fmt_short();
         let max_message_size = self.config.proto.max_message_size;
-        let (actor, to_actor) = Actor::new(endpoint, self.config, metrics.clone(), address_lookup);
+        let (actor, to_actor) = Actor::new(
+            endpoint,
+            self.config,
+            metrics.clone(),
+            address_lookup.clone(),
+        );
+        let stop = actor.stop.clone();
 
         let actor_handle = task::spawn(actor.run().instrument(error_span!("gossip", %me)));
 
         Gossip::new(
             to_actor,
+            stop,
             AbortOnDropHandle::new(actor_handle),
+            address_lookup,
             max_message_size,
             metrics,
         )
@@ -290,13 +341,17 @@ impl Gossip {
     /// Creates a handle for the actor task in `actor_handle`.
     fn new(
         to_actor: mpsc::Sender<ToActor>,
-        actor_handle: AbortOnDropHandle<()>,
+        stop: CancellationToken,
+        actor_handle: AbortOnDropHandle<Result<(), ()>>,
+        address_lookup: GossipAddressLookup,
         max_message_size: usize,
         metrics: Arc<Metrics>,
     ) -> Self {
         let inner = Inner {
             to_actor,
-            _actor_handle: actor_handle,
+            stop,
+            completion: Mutex::new(TaskCompletion::Running(actor_handle)),
+            address_lookup,
             max_message_size,
             max_content: proto::topic::max_content_size(max_message_size),
             metrics,
@@ -340,18 +395,23 @@ impl Gossip {
         let (commands_tx, commands_rx) = mpsc::channel(TOPIC_COMMANDS_CAP);
         let (events_tx, events_rx) = mpsc::channel(opts.subscription_capacity.max(1));
         let (registered_tx, registered_rx) = oneshot::channel();
-        self.inner
-            .to_actor
-            .send(ToActor::Join(Join {
-                topic_id,
-                bootstrap: opts.bootstrap,
-                events_tx,
-                commands_rx,
-                registered: registered_tx,
-            }))
-            .await
-            .map_err(|_| e!(Error::Closed))?;
-        registered_rx.await.map_err(|_| e!(Error::Closed))?;
+        let request = ToActor::Join(Join {
+            topic_id,
+            bootstrap: opts.bootstrap,
+            events_tx,
+            commands_rx,
+            registered: registered_tx,
+        });
+        tokio::select! {
+            biased;
+            _ = self.inner.stop.cancelled() => return Err(e!(Error::Closed)),
+            sent = self.inner.to_actor.send(request) => sent.map_err(|_| e!(Error::Closed))?,
+        }
+        tokio::select! {
+            biased;
+            _ = self.inner.stop.cancelled() => return Err(e!(Error::Closed)),
+            result = registered_rx => result.map_err(|_| e!(Error::Closed))?,
+        }
         Ok(GossipTopic::new(
             commands_tx,
             events_rx,
@@ -408,31 +468,39 @@ impl Gossip {
     /// Make sure to check the ALPN protocol yourself before passing the connection.
     ///
     /// Gossip owns the connection from now on. It closes the connection when neither side has
-    /// had a stream on it for ten seconds.
+    /// had a stream on it for ten seconds. A polled handoff that is cancelled
+    /// before acceptance closes its connection.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] if the gossip actor stopped.
     pub async fn handle_connection(&self, conn: Connection) -> Result<(), Error> {
-        self.inner
-            .to_actor
-            .send(ToActor::Connection(conn))
-            .await
-            .map_err(|_| e!(Error::Closed))?;
-        Ok(())
+        let handoff = ToActor::Connection(OwnedConnection(Some(conn)));
+        tokio::select! {
+            biased;
+            _ = self.inner.stop.cancelled() => Err(e!(Error::Closed)),
+            sent = self.inner.to_actor.send(handoff) => sent.map_err(|_| e!(Error::Closed)),
+        }
     }
 
     /// Shutdown the gossip instance.
     ///
-    /// This leaves all topics, sending `Disconnect` messages to peers, and then
-    /// stops the gossip actor loop and drops all state and connections. A gossip
-    /// instance that is shut down already, or shutting down, returns `Ok` too.
+    /// Stops the actor, closes its gossip connections, and retires its lookup.
+    /// On native runtimes, success means that the owned tasks have finished and
+    /// the host's endpoint can still be used. Browser task primitives provide
+    /// weaker completion and panic guarantees.
+    ///
+    /// Disconnect delivery during shutdown is best effort. The host is
+    /// responsible for settling its pending accept and connection handoffs.
+    /// Dropping a shutdown waiter leaves shutdown requested. Other handles
+    /// observe the same outcome. Dropping every handle without calling this
+    /// method requests a best-effort abort.
     pub async fn shutdown(&self) -> Result<(), Error> {
-        let (reply, reply_rx) = oneshot::channel();
-        let shutdown = ToActor::Shutdown { reply };
-        // The actor is gone or about to go, which is what the caller asks for.
-        if self.inner.to_actor.send(shutdown).await.is_ok() {
-            reply_rx.await.ok();
+        self.inner.stop.cancel();
+        if self.inner.completion.lock().await.wait().await.is_err() {
+            // The actor may have panicked before retiring the lookup.
+            let _ = self.inner.address_lookup.shutdown().await;
+            return Err(e!(Error::ShutdownFailed));
         }
         Ok(())
     }

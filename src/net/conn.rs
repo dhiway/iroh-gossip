@@ -11,7 +11,7 @@ use iroh::{
     EndpointId, PublicKey,
 };
 use n0_error::{e, stack_error};
-use n0_future::{boxed::BoxFuture, task, time, FuturesUnordered, StreamExt as _};
+use n0_future::{boxed::BoxFuture, time, FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error_span, warn, Instrument};
@@ -77,21 +77,6 @@ pub(super) enum ConnectionLoopError {
 impl<T> From<mpsc::error::SendError<T>> for ConnectionLoopError {
     fn from(_value: mpsc::error::SendError<T>) -> Self {
         e!(ConnectionLoopError::ActorDropped)
-    }
-}
-
-/// Returns a finished task's output, or `None` if the runtime cancelled the task.
-///
-/// A task cancelled at runtime shutdown is not a bug, so it must not panic the actor (#140).
-/// A panic in the task panics the caller with the same payload.
-pub(super) fn task_output<T>(res: Result<T, task::JoinError>) -> Option<T> {
-    match res {
-        Ok(output) => Some(output),
-        Err(err) if err.is_cancelled() => None,
-        #[cfg(not(target_family = "wasm"))]
-        Err(err) => std::panic::resume_unwind(err.into_panic()),
-        #[cfg(target_family = "wasm")]
-        Err(err) => panic!("task failed: {err}"),
     }
 }
 

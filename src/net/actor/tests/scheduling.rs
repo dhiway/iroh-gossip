@@ -350,7 +350,10 @@ async fn busy_publisher_does_not_starve_finished_connections() -> Result {
     actor.add_connection(conn);
     let mut addresses = n0_future::stream::pending();
     for _ in 0..256 {
-        actor.event_loop(&mut addresses).await;
+        actor
+            .event_loop(&mut addresses)
+            .await
+            .std_context("actor child task")?;
         tokio::task::yield_now().await;
         if actor.connection_tasks.is_empty() {
             return Ok(());

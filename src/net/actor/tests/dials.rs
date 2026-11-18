@@ -284,7 +284,10 @@ async fn dial_failure_keeps_a_peer_with_a_writer() -> Result {
     let addr_updates = &mut n0_future::stream::pending();
     timeout(Duration::from_secs(5), async {
         while metrics.actor_tick_dialer_failure.get() == 0 {
-            actor.event_loop(addr_updates).await;
+            actor
+                .event_loop(addr_updates)
+                .await
+                .expect("actor child task");
         }
     })
     .await

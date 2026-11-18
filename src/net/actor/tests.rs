@@ -25,7 +25,7 @@ use super::*;
 use crate::{
     api::{self, Command, Event, GossipReceiver, GossipSender},
     net::{
-        conn::{self, connection_loop, retire, task_output, RecvLoop, SendLoop, RETIRE_GRACE},
+        conn::{self, connection_loop, retire, RecvLoop, SendLoop, RETIRE_GRACE},
         peers::{ConnId, Finished, PeerState, PEER_RETENTION},
         queue::{Pushed, QueueLease, SendQueue},
         subscriptions::{
@@ -82,7 +82,10 @@ impl ManualActorLoop {
         // ignore updates that change our published address. This gives us better control over
         // events since the endpoint it no longer emitting changes
         let addr_update_stream = &mut n0_future::stream::pending();
-        actor.event_loop(addr_update_stream).await
+        actor
+            .event_loop(addr_update_stream)
+            .await
+            .expect("actor child task")
     }
 
     /// Steps until `done` holds, at most `max` times, and returns whether it holds.
@@ -137,7 +140,14 @@ impl Gossip {
         let max_message_size = actor.proto.max_message_size();
 
         let actor_handle = AbortOnDropHandle::new(task::spawn(n0_future::future::pending()));
-        let gossip = Self::new(to_actor, actor_handle, max_message_size, metrics);
+        let gossip = Self::new(
+            to_actor,
+            actor.stop.clone(),
+            actor_handle,
+            actor.state.address_lookup.clone(),
+            max_message_size,
+            metrics,
+        );
 
         let endpoint_task = task::spawn(endpoint_loop(
             actor.endpoint.clone(),

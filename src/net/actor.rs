@@ -8,24 +8,26 @@ use std::{
 use bytes::Bytes;
 use iroh::{endpoint::Connection, Endpoint, EndpointAddr, EndpointId, PublicKey, Watcher};
 use n0_future::{
-    task::JoinSet,
+    task::{JoinError, JoinSet},
     time::{self, Duration, Instant, Interval, MissedTickBehavior},
     Stream, StreamExt as _,
 };
 use rand::{rngs::StdRng, SeedableRng};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error_span, trace, warn, Instrument};
 
 use super::{
     address_lookup::{decode_peer_data, encode_peer_data, GossipAddressLookup},
-    conn::{connection_loop, task_output, ConnectionLoopError},
+    conn::{connection_loop, ConnectionLoopError},
     dialer::Dialer,
     peers::{Finished, PeerState, PEER_RETENTION},
     queue::{self, Pushed},
     subscriptions::{
         all_eager_peers_busy, topic_subscriber_loop, SubscriptionCommands, TopicHandles,
     },
-    InEvent, Join, ProtoCommand, ProtoEvent, ProtoMessage, QueueOptions, Timer, ToActor, ALPN,
+    InEvent, Join, OwnedConnection, ProtoCommand, ProtoEvent, ProtoMessage, QueueOptions, Timer,
+    ToActor, ALPN,
 };
 use crate::{
     api::Command,
@@ -91,6 +93,7 @@ pub(super) struct Actor {
     connection_tasks: JoinSet<(EndpointId, Connection, Result<bool, ConnectionLoopError>)>,
     topic_event_forwarders: JoinSet<TopicId>,
     metrics: Arc<Metrics>,
+    pub(super) stop: CancellationToken,
 }
 
 /// The state of the actor that the protocol reads and changes through [`ActorIO`].
@@ -169,15 +172,61 @@ impl Actor {
             connection_tasks: Default::default(),
             topic_event_forwarders: Default::default(),
             metrics,
+            stop: CancellationToken::new(),
         };
 
         (actor, to_actor_tx)
     }
 
-    pub(super) async fn run(mut self) {
+    pub(super) async fn run(mut self) -> Result<(), ()> {
+        let stop = self.stop.clone();
         let mut addr_update_stream = self.setup();
+        let outcome = loop {
+            let step = tokio::select! {
+                biased;
+                _ = stop.cancelled() => Ok(false),
+                step = self.event_loop(&mut addr_update_stream) => step,
+            };
+            match step {
+                Ok(true) => {}
+                outcome => break outcome,
+            }
+        };
+        let cleanup = self.teardown().await;
+        if let Err(err) = outcome {
+            warn!(?err, "gossip child task ended unexpectedly");
+            return Err(());
+        }
+        cleanup
+    }
 
-        while self.event_loop(&mut addr_update_stream).await {}
+    async fn teardown(&mut self) -> Result<(), ()> {
+        self.stop.cancel();
+        self.to_actor_rx.close();
+        while self.to_actor_rx.try_recv().is_ok() {}
+        self.in_event_rx.close();
+
+        // Send, receive and stream futures live inside each connection task.
+        // Joining the task after abort observes destruction of all of them.
+        self.connection_tasks.abort_all();
+        self.topic_event_forwarders.abort_all();
+        let mut failed = self.state.dialer.shutdown().await.is_err();
+        while let Some(result) = self.connection_tasks.join_next().await {
+            if let Err(err) = result {
+                failed |= !err.is_cancelled();
+            }
+        }
+        while let Some(result) = self.topic_event_forwarders.join_next().await {
+            if let Err(err) = result {
+                failed |= !err.is_cancelled();
+            }
+        }
+        failed |= self.state.address_lookup.shutdown().await.is_err();
+        if failed {
+            Err(())
+        } else {
+            Ok(())
+        }
     }
 
     /// Handles a message from the [`Gossip`] handle, and returns `false` to stop the actor.
@@ -193,18 +242,8 @@ impl Actor {
                 true
             }
             Some(ToActor::Connection(conn)) => {
-                self.add_connection(conn);
+                self.add_connection(conn.into_inner());
                 true
-            }
-            Some(ToActor::Shutdown { reply }) => {
-                debug!("received shutdown message, quit all topics");
-                self.state
-                    .quit_queue
-                    .extend(self.state.topics.keys().copied());
-                self.process_quit_queue();
-                debug!("all topics quit, stop gossip actor");
-                reply.send(()).ok();
-                false
             }
             None => {
                 debug!("all gossip handles dropped, stop gossip actor");
@@ -226,18 +265,16 @@ impl Actor {
 
     /// One event loop processing step.
     ///
-    /// Returns `false` when the actor should stop.
+    /// Returns `false` when the handle channel closes.
     async fn event_loop(
         &mut self,
         addr_updates: &mut (impl Stream<Item = EndpointAddr> + Send + Unpin),
-    ) -> bool {
+    ) -> Result<bool, JoinError> {
         self.metrics.actor_tick_main.inc();
-        // A shutdown skips the other branches. It waits only for the messages of the
-        // handle queued before it. Each tick still runs the select below, so these
-        // messages starve no other branch.
+        // One queued handoff gets a turn before the unbiased select.
         if let Ok(msg) = self.to_actor_rx.try_recv() {
             if !self.on_message(Some(msg)) {
-                return false;
+                return Ok(false);
             }
         }
         // Not biased: a publisher that always has a command ready would starve the
@@ -245,7 +282,7 @@ impl Actor {
         tokio::select! {
             msg = self.to_actor_rx.recv() => {
                 if !self.on_message(msg) {
-                    return false;
+                    return Ok(false);
                 }
             }
             Some((topic, command)) = self.command_rx.next(|topic| {
@@ -260,13 +297,14 @@ impl Actor {
                 self.metrics.actor_tick_endpoint.inc();
                 self.on_addr_update(new_address);
             }
-            (peer_id, res) = self.state.dialer.next_conn() => {
+            result = self.state.dialer.next_conn() => {
+                let (peer_id, res) = result?;
                 self.metrics.actor_tick_dialer.inc();
                 match res {
                     Ok(conn) => {
                         debug!(peer = %peer_id.fmt_short(), "dial successful");
                         self.metrics.actor_tick_dialer_success.inc();
-                        self.add_connection(conn);
+                        self.add_connection(conn.into_inner());
                     }
                     Err(err) => {
                         warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
@@ -293,17 +331,11 @@ impl Actor {
                 }
             }
             Some(res) = self.connection_tasks.join_next(), if !self.connection_tasks.is_empty() => {
-                let Some((peer_id, conn, result)) = task_output(res) else {
-                    debug!("connection task cancelled, the runtime shuts down");
-                    return false;
-                };
+                let (peer_id, conn, result) = res?;
                 self.on_conn_task_finished(peer_id, conn, result);
             }
             Some(res) = self.topic_event_forwarders.join_next(), if !self.topic_event_forwarders.is_empty() => {
-                let Some(topic_id) = task_output(res) else {
-                    debug!("topic task cancelled, the runtime shuts down");
-                    return false;
-                };
+                let topic_id = res?;
                 if let Some(handles) = self.state.topics.get_mut(&topic_id) {
                     if handles.is_empty() {
                         self.state.quit_queue.push_back(topic_id);
@@ -313,7 +345,7 @@ impl Actor {
             }
         }
 
-        true
+        Ok(true)
     }
 
     fn on_addr_update(&mut self, endpoint_addr: EndpointAddr) {
@@ -352,6 +384,7 @@ impl Actor {
     }
 
     fn add_connection(&mut self, conn: Connection) {
+        let owned = OwnedConnection(Some(conn.clone()));
         if let Some(max) = self.state.max_peer_streams {
             conn.set_max_concurrent_uni_streams(max.into());
         }
@@ -378,6 +411,7 @@ impl Actor {
         // Spawn a task for this connection
         self.connection_tasks.spawn(
             async move {
+                let _owned = owned;
                 let res = connection_loop(
                     peer_id,
                     conn.clone(),

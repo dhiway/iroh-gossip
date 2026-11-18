@@ -19,7 +19,10 @@ use n0_future::{
     time::SystemTime,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
+use super::TaskCompletion;
 use crate::proto::PeerData;
 
 /// The most addresses we keep for an endpoint.
@@ -51,7 +54,8 @@ impl Default for RetentionOpts {
 #[derive(Debug, Clone)]
 pub(super) struct GossipAddressLookup {
     endpoints: NodeMap,
-    _task_handle: Arc<AbortOnDropHandle<()>>,
+    stop: CancellationToken,
+    completion: Arc<Mutex<TaskCompletion>>,
 }
 
 type NodeMap = Arc<RwLock<BTreeMap<EndpointId, StoredEndpointInfo>>>;
@@ -78,12 +82,18 @@ impl GossipAddressLookup {
 
     fn with_opts(opts: RetentionOpts) -> Self {
         let endpoints: NodeMap = Default::default();
+        let stop = CancellationToken::new();
         let task = {
             let endpoints = Arc::downgrade(&endpoints);
+            let stop = stop.clone();
             n0_future::task::spawn(async move {
                 let mut interval = n0_future::time::interval(opts.evict_interval);
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
                     let Some(endpoints) = endpoints.upgrade() else {
                         break;
                     };
@@ -93,11 +103,38 @@ impl GossipAddressLookup {
                         age <= opts.retention
                     });
                 }
+                Ok(())
             })
         };
         Self {
             endpoints,
-            _task_handle: Arc::new(AbortOnDropHandle::new(task)),
+            stop,
+            completion: Arc::new(Mutex::new(TaskCompletion::Running(AbortOnDropHandle::new(
+                task,
+            )))),
+        }
+    }
+
+    /// Retire the lookup even when the endpoint retains a clone of it.
+    ///
+    /// A stream returned before shutdown keeps the snapshot it already owns.
+    pub(super) async fn shutdown(&self) -> Result<(), ()> {
+        self.stop.cancel();
+        let poisoned = match self.endpoints.write() {
+            Ok(mut endpoints) => {
+                endpoints.clear();
+                false
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().clear();
+                true
+            }
+        };
+        self.completion.lock().await.wait().await?;
+        if poisoned {
+            Err(())
+        } else {
+            Ok(())
         }
     }
 
@@ -106,9 +143,15 @@ impl GossipAddressLookup {
     /// The provided addresses come first, then the ones already stored, up to
     /// [`MAX_ADDRS`]. The user data is overwritten.
     pub(super) fn add(&self, endpoint_info: impl Into<EndpointInfo>) {
+        if self.stop.is_cancelled() {
+            return;
+        }
         let last_updated = SystemTime::now();
         let EndpointInfo { endpoint_id, data } = endpoint_info.into();
         let mut guard = self.endpoints.write().expect("poisoned");
+        if self.stop.is_cancelled() {
+            return;
+        }
         let stored = guard
             .entry(endpoint_id)
             .or_insert_with(|| StoredEndpointInfo {
@@ -128,7 +171,13 @@ impl AddressLookup for GossipAddressLookup {
         &self,
         endpoint_id: EndpointId,
     ) -> Option<BoxStream<Result<address_lookup::Item, address_lookup::Error>>> {
+        if self.stop.is_cancelled() {
+            return None;
+        }
         let guard = self.endpoints.read().expect("poisoned");
+        if self.stop.is_cancelled() {
+            return None;
+        }
         let info = guard.get(&endpoint_id)?;
         let last_updated = info
             .last_updated

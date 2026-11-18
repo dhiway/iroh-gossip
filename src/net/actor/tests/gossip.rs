@@ -324,23 +324,6 @@ async fn subscription_cleanup() -> Result {
     Ok(())
 }
 
-/// A cancelled task gives `None`, and a finished one its output.
-#[tokio::test]
-async fn task_output_of_cancelled_and_finished_tasks() {
-    let task = task::spawn(std::future::pending::<u32>());
-    task.abort();
-    assert!(task_output(task.await).is_none());
-    assert_eq!(task_output(task::spawn(async { 42u32 }).await), Some(42));
-}
-
-/// A panic in a task panics the caller with the same payload.
-#[cfg(not(target_family = "wasm"))]
-#[tokio::test]
-#[should_panic(expected = "original child panic")]
-async fn task_output_passes_a_panic_on() {
-    task_output(task::spawn(async { panic!("original child panic") }).await);
-}
-
 /// `broadcast` refuses a message that does not fit a frame at every hop.
 #[tokio::test]
 #[traced_test]
