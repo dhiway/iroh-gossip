@@ -1,12 +1,16 @@
 //! An address lookup service to gather addressing info collected from gossip Join and ForwardJoin messages.
 
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
-use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo};
+use iroh::{
+    address_lookup::{self, AddressLookup, EndpointData, EndpointInfo},
+    EndpointAddr, RelayUrl,
+};
 use iroh_base::EndpointId;
 use n0_future::{
     boxed::BoxStream,
@@ -14,8 +18,20 @@ use n0_future::{
     task::AbortOnDropHandle,
     time::SystemTime,
 };
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-pub(crate) struct RetentionOpts {
+use super::TaskCompletion;
+use crate::proto::PeerData;
+
+/// The most addresses we keep for an endpoint.
+///
+/// Every update adds the addresses that it carries, so without a cap, a peer
+/// whose addresses keep changing grows its entry without limit.
+const MAX_ADDRS: usize = 32;
+
+struct RetentionOpts {
     /// How long to keep received endpoint info records alive before pruning them
     retention: Duration,
     /// How often to check for expired entries
@@ -36,9 +52,10 @@ impl Default for RetentionOpts {
 /// It is added to the endpoint when constructing a gossip instance, and the gossip actor
 /// then adds endpoint addresses as received with Join or ForwardJoin messages.
 #[derive(Debug, Clone)]
-pub(crate) struct GossipAddressLookup {
+pub(super) struct GossipAddressLookup {
     endpoints: NodeMap,
-    _task_handle: Arc<AbortOnDropHandle<()>>,
+    stop: CancellationToken,
+    completion: Arc<Mutex<TaskCompletion>>,
 }
 
 type NodeMap = Arc<RwLock<BTreeMap<EndpointId, StoredEndpointInfo>>>;
@@ -59,18 +76,24 @@ impl GossipAddressLookup {
     const PROVENANCE: &'static str = "gossip";
 
     /// Creates a new gossip address lookup instance.
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self::with_opts(Default::default())
     }
 
-    pub(crate) fn with_opts(opts: RetentionOpts) -> Self {
+    fn with_opts(opts: RetentionOpts) -> Self {
         let endpoints: NodeMap = Default::default();
+        let stop = CancellationToken::new();
         let task = {
             let endpoints = Arc::downgrade(&endpoints);
+            let stop = stop.clone();
             n0_future::task::spawn(async move {
                 let mut interval = n0_future::time::interval(opts.evict_interval);
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
                     let Some(endpoints) = endpoints.upgrade() else {
                         break;
                     };
@@ -80,34 +103,66 @@ impl GossipAddressLookup {
                         age <= opts.retention
                     });
                 }
+                Ok(())
             })
         };
         Self {
             endpoints,
-            _task_handle: Arc::new(AbortOnDropHandle::new(task)),
+            stop,
+            completion: Arc::new(Mutex::new(TaskCompletion::Running(AbortOnDropHandle::new(
+                task,
+            )))),
+        }
+    }
+
+    /// Retire the lookup even when the endpoint retains a clone of it.
+    ///
+    /// A stream returned before shutdown keeps the snapshot it already owns.
+    pub(super) async fn shutdown(&self) -> Result<(), ()> {
+        self.stop.cancel();
+        let poisoned = match self.endpoints.write() {
+            Ok(mut endpoints) => {
+                endpoints.clear();
+                false
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().clear();
+                true
+            }
+        };
+        self.completion.lock().await.wait().await?;
+        if poisoned {
+            Err(())
+        } else {
+            Ok(())
         }
     }
 
     /// Augments endpoint addressing information for the given endpoint ID.
     ///
-    /// The provided addressing information is combined with the existing info in the in-memory
-    /// lookup.  Any new direct addresses are added to those already present while the
-    /// relay URL is overwritten.
-    pub(crate) fn add(&self, endpoint_info: impl Into<EndpointInfo>) {
+    /// The provided addresses come first, then the ones already stored, up to
+    /// [`MAX_ADDRS`]. The user data is overwritten.
+    pub(super) fn add(&self, endpoint_info: impl Into<EndpointInfo>) {
+        if self.stop.is_cancelled() {
+            return;
+        }
         let last_updated = SystemTime::now();
         let EndpointInfo { endpoint_id, data } = endpoint_info.into();
         let mut guard = self.endpoints.write().expect("poisoned");
-        match guard.entry(endpoint_id) {
-            Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                existing.data.add_addrs(data.addrs().cloned());
-                existing.data.set_user_data(data.user_data().cloned());
-                existing.last_updated = last_updated;
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(StoredEndpointInfo { data, last_updated });
-            }
+        if self.stop.is_cancelled() {
+            return;
         }
+        let stored = guard
+            .entry(endpoint_id)
+            .or_insert_with(|| StoredEndpointInfo {
+                data: EndpointData::default(),
+                last_updated,
+            });
+        // `EndpointData::new` drops the duplicates.
+        let addrs = data.addrs().chain(stored.data.addrs());
+        stored.data = EndpointData::new(addrs.take(MAX_ADDRS).cloned().collect());
+        stored.data.set_user_data(data.user_data().cloned());
+        stored.last_updated = last_updated;
     }
 }
 
@@ -116,7 +171,13 @@ impl AddressLookup for GossipAddressLookup {
         &self,
         endpoint_id: EndpointId,
     ) -> Option<BoxStream<Result<address_lookup::Item, address_lookup::Error>>> {
+        if self.stop.is_cancelled() {
+            return None;
+        }
         let guard = self.endpoints.read().expect("poisoned");
+        if self.stop.is_cancelled() {
+            return None;
+        }
         let info = guard.get(&endpoint_id)?;
         let last_updated = info
             .last_updated
@@ -132,15 +193,44 @@ impl AddressLookup for GossipAddressLookup {
     }
 }
 
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub(super) struct AddrInfo {
+    pub(super) relay_url: Option<RelayUrl>,
+    pub(super) direct_addresses: BTreeSet<SocketAddr>,
+}
+
+impl From<EndpointAddr> for AddrInfo {
+    fn from(endpoint_addr: EndpointAddr) -> Self {
+        Self {
+            relay_url: endpoint_addr.relay_urls().next().cloned(),
+            direct_addresses: endpoint_addr.ip_addrs().cloned().collect(),
+        }
+    }
+}
+
+pub(super) fn encode_peer_data(info: &AddrInfo) -> PeerData {
+    let bytes = postcard::to_stdvec(info).expect("serializing AddrInfo may not fail");
+    PeerData::new(bytes)
+}
+
+pub(super) fn decode_peer_data(peer_data: &PeerData) -> Result<AddrInfo, postcard::Error> {
+    let bytes = peer_data.as_bytes();
+    if bytes.is_empty() {
+        return Ok(AddrInfo::default());
+    }
+    let info = postcard::from_bytes(bytes)?;
+    Ok(info)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{net::SocketAddr, time::Duration};
 
     use iroh::{address_lookup::AddressLookup, EndpointAddr, SecretKey};
     use n0_future::StreamExt;
     use rand::{RngExt, SeedableRng};
 
-    use super::{GossipAddressLookup, RetentionOpts};
+    use super::{GossipAddressLookup, RetentionOpts, MAX_ADDRS};
 
     #[tokio::test]
     async fn test_retention() {
@@ -171,5 +261,22 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(700)).await;
 
         assert!(disco.resolve(k1.public()).is_none());
+    }
+
+    /// A peer whose address keeps changing has its newest addresses kept, up to the cap.
+    #[tokio::test]
+    async fn changing_addresses_stay_capped() {
+        let disco = GossipAddressLookup::new();
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let id = SecretKey::from_bytes(&rng.random()).public();
+        let addr = |port| SocketAddr::from(([10, 0, 0, 1], port));
+        for port in 0..1000 {
+            disco.add(EndpointAddr::new(id).with_ip_addr(addr(port)));
+        }
+
+        let endpoints = disco.endpoints.read().expect("poisoned");
+        let ip_addrs: Vec<_> = endpoints[&id].data.ip_addrs().copied().collect();
+        assert_eq!(ip_addrs.len(), MAX_ADDRS);
+        assert_eq!(ip_addrs[0], addr(999), "the newest address comes first");
     }
 }

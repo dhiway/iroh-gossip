@@ -1,6 +1,6 @@
 [package]
 name = "iroh-gossip"
-version = "0.101.0"
+version = "0.103.0"
 edition = "2021"
 readme = "README.md"
 description = "gossip messages over broadcast trees"
@@ -13,7 +13,7 @@ resolver = "2"
 rust-version = "1.91"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["lib", "cdylib"]
 
 [lints.rust]
 missing_debug_implementations = "warn"
@@ -33,9 +33,9 @@ unused-async = "warn"
 
 [dependencies]
 blake3 = "1.8"
-bytes = { version = "1.7", features = ["serde"] }
-data-encoding = "2.6.0"
-derive_more = { version = "2.0.1", features = [
+bytes = { version = "1.12", features = ["serde"] }
+data-encoding = "2.11.1"
+derive_more = { version = "2.1.1", features = [
     "add",
     "debug",
     "deref",
@@ -45,8 +45,8 @@ derive_more = { version = "2.0.1", features = [
     "into",
 ] }
 hex = "0.4.3"
-indexmap = "2.0"
-iroh-metrics = { version = "1.0.1", default-features = false }
+indexmap = "2.14"
+iroh-metrics = { version = "1.0.2", default-features = false }
 iroh-base = { version = "1", default-features = false, features = ["key"] }
 n0-future = "0.3"
 postcard = { version = "1", default-features = false, features = [
@@ -54,37 +54,29 @@ postcard = { version = "1", default-features = false, features = [
     "use-std",
     "experimental-derive",
 ] }
-rand = { version = "0.10.1", features = ["std_rng"] }
-serde = { version = "1.0.164", features = ["derive"] }
+rand = { version = "0.10.3", features = ["std_rng"] }
+rustc-hash = "2.1"
+serde = { version = "1.0.229", features = ["derive"] }
 
 # net dependencies (optional)
-futures-concurrency = { version = "7.6.1", optional = true }
-iroh = { version = "1", default-features = false, optional = true }
-tokio = { version = "1", optional = true, features = ["io-util", "sync"] }
-tokio-util = { version = "0.7.12", optional = true, features = ["codec"] }
+iroh = { version = "1.4", default-features = false, optional = true }
+tokio = { version = "1.54", optional = true, features = ["io-util", "sync"] }
+tokio-util = { version = "0.7.20", optional = true, features = ["codec"] }
 tracing = "0.1"
-irpc = { version = "0.17.0", optional = true, default-features = false, features = [
-    "derive",
-    "stream",
-    "spans",
-] }
 n0-error = { version = "1", features = ["anyhow"] }
-
-# rpc dependencies (optional)
-noq = { version = "1", optional = true, default-features = false }
 
 # test-utils dependencies (optional)
 humantime-serde = { version = "1.1.1", optional = true }
 
 # simulator dependencies (optional)
 clap = { version = "4", features = ["derive"], optional = true }
-toml = { version = "1.1.2", optional = true }
+toml = { version = "1.2.1", optional = true }
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
 ], optional = true }
 serde_json = { version = "1", optional = true }
-rayon = { version = "1.10.0", optional = true }
-comfy-table = { version = "7.1.4", optional = true }
+rayon = { version = "1.12.0", optional = true }
+comfy-table = { version = "7.2.2", optional = true }
 
 
 [dev-dependencies]
@@ -95,40 +87,33 @@ tokio = { version = "1", features = [
     "macros",
     "net",
     "fs",
+    "test-util",
 ] }
 clap = { version = "4", features = ["derive"] }
+futures-concurrency = "7.7.1"
 humantime-serde = { version = "1.1.1" }
 iroh = { version = "1", default-features = false, features = [
     "metrics",
     "test-utils",
     "tls-ring"
 ] }
-testresult = "0.4.1"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+testresult = "0.4.2"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 n0-tracing-test = "0.3"
-url = "2.4.0"
+url = "2.5.8"
 serde-byte-array = "0.1.2"
 rand = { version = "0.10", features = ["chacha"] }
 
 [features]
 default = ["net", "metrics"]
 net = [
-    "dep:irpc",
     "dep:iroh",
     "dep:tokio",
     "dep:tokio-util",
-    "dep:futures-concurrency",
 ]
-rpc = [
-    "dep:irpc",
-    "dep:tokio",
-    "dep:noq",
-    "irpc/rpc",
-    "irpc/noq_endpoint_setup",
-]
-rpc-tls-ring = ["noq/ring"]
-rpc-tls-aws-lc-rs = ["noq/aws-lc-rs"]
-test-utils = ["rand/chacha", "dep:humantime-serde"]
+# Makes the protocol state machine public. Its API may change in any release.
+experimental-proto-internals = []
+test-utils = ["experimental-proto-internals", "rand/chacha", "dep:humantime-serde"]
 simulator = [
     "test-utils",
     "dep:tracing-subscriber",
@@ -146,6 +131,16 @@ name = "sim"
 path = "tests/sim.rs"
 required-features = ["test-utils"]
 
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["net"]
+
+[[test]]
+name = "paper"
+path = "tests/paper.rs"
+required-features = ["test-utils"]
+
 [[bin]]
 name = "sim"
 required-features = ["simulator"]
@@ -159,7 +154,9 @@ name = "setup"
 required-features = ["examples"]
 
 [package.metadata.docs.rs]
-all-features = true
+# The docs show the stable API only: no test-utils, simulator or experimental-proto-internals.
+# The docs preview workflow builds with this list too, through `cargo docs-rs`.
+features = ["net", "metrics"]
 rustdoc-args = ["--cfg", "iroh_docsrs"]
 
 [profile.bench]
@@ -168,3 +165,16 @@ debug = true
 [profile.release]
 debug = true
 
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    # crates owned by us that are 1.0
+    "iroh::*",
+    "iroh_base::*",
+    "iroh_metrics::*",
+    "n0_error::*",
+    # 1.0 crates that we deem fine to be part of the public API
+    "bytes::*",
+    "serde_core::*",
+    # non-1.0 crates that we decided to accept in the public API
+    "futures_core::stream::Stream",
+]

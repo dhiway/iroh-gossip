@@ -2,23 +2,36 @@
 
 use iroh_metrics::{Counter, MetricsGroup};
 
-/// Enum of metrics for the module
+/// The counters of a gossip instance.
 #[derive(Debug, Default, MetricsGroup)]
+#[non_exhaustive]
 #[metrics(name = "gossip")]
 pub struct Metrics {
     /// Number of control messages sent
+    ///
+    /// It counts one message for each peer whose send queue took it. [`Self::msgs_dropped`]
+    /// counts the messages that a full queue dropped. A message to a peer that we abort
+    /// for a full queue counts nowhere, see [`Self::peers_send_queue_full`].
     pub msgs_ctrl_sent: Counter,
     /// Number of control messages received
     pub msgs_ctrl_recv: Counter,
     /// Number of data messages sent
+    ///
+    /// It counts one message for each peer whose send queue took it. [`Self::msgs_dropped`]
+    /// counts the messages that a full queue dropped. A message to a peer that we abort
+    /// for a full queue counts nowhere, see [`Self::peers_send_queue_full`].
     pub msgs_data_sent: Counter,
     /// Number of data messages received
     pub msgs_data_recv: Counter,
-    /// Total size of all data messages sent
+    /// Number of data messages and announcements dropped because the send queue to their peer was full
+    pub msgs_dropped: Counter,
+    /// Number of peers aborted because their send queue had no room for a control message
+    pub peers_send_queue_full: Counter,
+    /// Total size of all data messages sent, counted as [`Self::msgs_data_sent`]
     pub msgs_data_sent_size: Counter,
     /// Total size of all data messages received
     pub msgs_data_recv_size: Counter,
-    /// Total size of all control messages sent
+    /// Total size of all control messages sent, counted as [`Self::msgs_ctrl_sent`]
     pub msgs_ctrl_sent_size: Counter,
     /// Total size of all control messages received
     pub msgs_ctrl_recv_size: Counter,
