@@ -1,5 +1,8 @@
 [advisories]
 yanked = "deny"
+ignore = [
+    "RUSTSEC-2026-0543", # unmaintained: chrono, pulled in transitively by iroh
+]
 
 [bans]
 deny = [
